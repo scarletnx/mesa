@@ -61,7 +61,9 @@ static const struct vk_instance_extension_table instance_extensions = {
 #ifdef VK_USE_PLATFORM_METAL_EXT
    .EXT_metal_surface = true,
 #endif
-#ifndef VK_USE_PLATFORM_METAL_EXT
+   /* The headless surface is not the metal surface's alternative: wsi_common.c starts both WSI backends on a host that
+      is not Windows, so a metal host has the headless surface too. */
+#ifndef VK_USE_PLATFORM_WIN32_KHR
    .EXT_headless_surface = true,
 #endif
    .KHR_device_group_creation = true,
