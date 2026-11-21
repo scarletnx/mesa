@@ -918,6 +918,34 @@ src_to_packed_store(struct nir_to_msl_ctx *ctx, nir_src *src,
    P(ctx, ")");
 }
 
+/* The address of a cooperative matrix load or store. The layout is the one
+ * of addr_to_global in nir_lower_explicit_io.c: a 4-component global address
+ * (bounded or 32-bit offset, the SSBO formats of kk) has the 64-bit base in
+ * .x (low) and .y (high), its size in .z and its byte offset in .w. A scalar
+ * 64-bit address is a device address. A scalar 32-bit address is an offset
+ * into the shared memory of the workgroup (32bit_offset). */
+static void
+cmat_ptr_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, const char *type)
+{
+   if (src->ssa->num_components == 4) {
+      P(ctx, "(device %s*)((((ulong)(", type);
+      src_to_msl(ctx, src);
+      P(ctx, ").y << 32) | (ulong)(");
+      src_to_msl(ctx, src);
+      P(ctx, ").x) + (");
+      src_to_msl(ctx, src);
+      P(ctx, ").w)");
+   } else if (src->ssa->bit_size == 64) {
+      P(ctx, "(device %s*)(", type);
+      src_to_msl(ctx, src);
+      P(ctx, ")");
+   } else {
+      P(ctx, "(threadgroup %s*)&shared_data[", type);
+      src_to_msl(ctx, src);
+      P(ctx, "]");
+   }
+}
+
 static const char *
 atomic_op_to_msl(nir_atomic_op op)
 {
@@ -1823,16 +1851,16 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       break;
    case nir_intrinsic_cmat_load:
       assert(nir_src_is_const(instr->src[2]));
-      P_IND(ctx, "simdgroup_load(cm%u, (threadgroup %s*)", cmat_var_index(instr->src[0]),
-            cmat_is_half(instr->src[0]) ? "half" : "float");
-      src_to_msl(ctx, &instr->src[1]);
+      P_IND(ctx, "simdgroup_load(cm%u, ", cmat_var_index(instr->src[0]));
+      cmat_ptr_to_msl(ctx, &instr->src[1],
+                      cmat_is_half(instr->src[0]) ? "half" : "float");
       P(ctx, ", %uu);\n", (unsigned)nir_src_as_uint(instr->src[2]));
       break;
    case nir_intrinsic_cmat_store:
       assert(nir_src_is_const(instr->src[2]));
-      P_IND(ctx, "simdgroup_store(cm%u, (threadgroup %s*)", cmat_var_index(instr->src[1]),
-            cmat_is_half(instr->src[1]) ? "half" : "float");
-      src_to_msl(ctx, &instr->src[0]);
+      P_IND(ctx, "simdgroup_store(cm%u, ", cmat_var_index(instr->src[1]));
+      cmat_ptr_to_msl(ctx, &instr->src[0],
+                      cmat_is_half(instr->src[1]) ? "half" : "float");
       P(ctx, ", %uu);\n", (unsigned)nir_src_as_uint(instr->src[2]));
       break;
    default:
