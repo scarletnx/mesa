@@ -924,6 +924,19 @@ src_to_packed_store(struct nir_to_msl_ctx *ctx, nir_src *src,
  * .x (low) and .y (high), its size in .z and its byte offset in .w. A scalar
  * 64-bit address is a device address. A scalar 32-bit address is an offset
  * into the shared memory of the workgroup (32bit_offset). */
+/* MSL's simdgroup_load and simdgroup_store take a transpose flag in place of a
+ * layout enum. A column-major matrix in memory is the transpose of the row-major
+ * one, so the flag is set for it. The defaults (origin 0, no transpose) stay
+ * for row-major, and for GLSL_MATRIX_LAYOUT_INHERITED, which reads as row-major.
+ */
+static const char *
+cmat_transpose_args(nir_intrinsic_instr *instr)
+{
+   return nir_intrinsic_matrix_layout(instr) == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR
+             ? ", ulong2(0, 0), true"
+             : "";
+}
+
 static void
 cmat_ptr_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, const char *type)
 {
@@ -1854,14 +1867,16 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P_IND(ctx, "simdgroup_load(cm%u, ", cmat_var_index(instr->src[0]));
       cmat_ptr_to_msl(ctx, &instr->src[1],
                       cmat_is_half(instr->src[0]) ? "half" : "float");
-      P(ctx, ", %uu);\n", (unsigned)nir_src_as_uint(instr->src[2]));
+      P(ctx, ", %uu%s);\n", (unsigned)nir_src_as_uint(instr->src[2]),
+        cmat_transpose_args(instr));
       break;
    case nir_intrinsic_cmat_store:
       assert(nir_src_is_const(instr->src[2]));
       P_IND(ctx, "simdgroup_store(cm%u, ", cmat_var_index(instr->src[1]));
       cmat_ptr_to_msl(ctx, &instr->src[0],
                       cmat_is_half(instr->src[1]) ? "half" : "float");
-      P(ctx, ", %uu);\n", (unsigned)nir_src_as_uint(instr->src[2]));
+      P(ctx, ", %uu%s);\n", (unsigned)nir_src_as_uint(instr->src[2]),
+        cmat_transpose_args(instr));
       break;
    default:
       P_IND(ctx, "Unknown intrinsic %s\n", info->name);
