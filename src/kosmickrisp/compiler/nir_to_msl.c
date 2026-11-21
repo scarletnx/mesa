@@ -1799,6 +1799,25 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       /* Point to NULL, not really used currently */
       P(ctx, "0x0;\n");
       break;
+   case nir_intrinsic_cmat_load: {
+      const int m = instr->def.bit_size == 16;
+      P_IND(ctx, "%s t%d;\n", m ? "simdgroup_half8x8" : "simdgroup_float8x8", instr->def.index);
+      P_IND(ctx, "simdgroup_load(t%d, (threadgroup %s*)&", instr->def.index, m ? "half" : "float");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, "[");
+      src_to_msl(ctx, &instr->src[1]);
+      P(ctx, "], 8);\n");
+      break;
+   }
+   case nir_intrinsic_cmat_store: {
+      const int m = instr->src[1].ssa ? instr->src[1].ssa->bit_size == 16 : 0;
+      P_IND(ctx, "simdgroup_store(t%d, (threadgroup %s*)&", instr->src[0].ssa->index, m ? "half" : "float");
+      src_to_msl(ctx, &instr->src[2]);
+      P(ctx, "[");
+      src_to_msl(ctx, &instr->src[3]);
+      P(ctx, "], 8);\n");
+      break;
+   }
    default:
       P_IND(ctx, "Unknown intrinsic %s\n", info->name);
    }
