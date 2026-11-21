@@ -1812,6 +1812,10 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       cmat_splat_to_msl(ctx, &instr->src[1], cmat_is_half(instr->src[0]));
       P(ctx, ");\n");
       break;
+   case nir_intrinsic_cmat_copy:
+      /* src[0] is the destination variable, src[1] the source (split_cmat_copy reads them in that order) */
+      P_IND(ctx, "cm%u = cm%u;\n", cmat_var_index(instr->src[0]), cmat_var_index(instr->src[1]));
+      break;
    case nir_intrinsic_cmat_muladd:
       P_IND(ctx, "simdgroup_multiply_accumulate(cm%u, cm%u, cm%u, cm%u);\n",
             cmat_var_index(instr->src[0]), cmat_var_index(instr->src[1]),
