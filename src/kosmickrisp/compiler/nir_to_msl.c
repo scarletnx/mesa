@@ -5,6 +5,7 @@
  */
 
 #include "nir_to_msl.h"
+#include <stdlib.h>
 #include "msl_private.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -69,6 +70,10 @@ static const char *sysval_table[SYSTEM_VALUE_MAX] = {
 };
 static const char *sysval_sample_mask_in_post_depth_coverage =
    "uint gl_SampleMask [[sample_mask, post_depth_coverage]]";
+
+static void emit_def_assign_start(struct nir_to_msl_ctx *ctx, nir_def *def);
+static bool uses_in_same_block(nir_def *def);
+static void alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr);
 
 static void
 emit_sysvals(struct nir_to_msl_ctx *ctx, nir_shader *shader)
@@ -199,6 +204,10 @@ src_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src)
       }
    } else if (nir_src_is_const(*src)) {
       msl_src_as_const(ctx, src);
+   } else if (ctx->fold && src->ssa->index < ctx->fold_count && ctx->fold[src->ssa->index]) {
+      P(ctx, "((%s)(", msl_type_for_src(ctx->types, src));
+      alu_to_msl(ctx, nir_instr_as_alu(nir_def_instr(src->ssa)));
+      P(ctx, "))");
    } else {
       P(ctx, "t%d", src->ssa->index);
    }
@@ -1107,7 +1116,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 
    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
    if (instrinsic_needs_dest_type(instr)) {
-      P_IND(ctx, "t%d = ", instr->def.index);
+      emit_def_assign_start(ctx, &instr->def);
    }
    switch (instr->intrinsic) {
    case nir_intrinsic_decl_reg: {
@@ -1811,6 +1820,66 @@ tex_coord_swizzle(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
                              tex->coord_components, false, tex->is_array);
 }
 
+#define KK_FOLD_MAX 6
+static unsigned
+fold_cost(struct nir_to_msl_ctx *ctx, nir_alu_instr *alu)
+{
+   unsigned n = 1;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      nir_src *s2 = &alu->src[i].src;
+      if (s2->ssa && s2->ssa->index < ctx->fold_count && ctx->fold[s2->ssa->index])
+         n += fold_cost(ctx, nir_instr_as_alu(nir_def_instr(s2->ssa)));
+   }
+   return n;
+}
+
+static bool
+fold_has_folded_src(struct nir_to_msl_ctx *ctx, nir_alu_instr *alu)
+{
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      nir_src *s2 = &alu->src[i].src;
+      if (s2->ssa && s2->ssa->index < ctx->fold_count && ctx->fold[s2->ssa->index])
+         return true;
+   }
+   return false;
+}
+
+static bool
+folds_into_use(struct nir_to_msl_ctx *ctx, nir_def *def)
+{
+   if (!uses_in_same_block(def))
+      return false;
+   nir_foreach_use(use, def) {
+      if (msl_bitcast_for_src(ctx->types, use) != NULL)
+         return false;
+      if (!msl_type_for_src(ctx->types, use))
+         return false;
+   }
+   return true;
+}
+
+static void
+emit_def_assign_start(struct nir_to_msl_ctx *ctx, nir_def *def)
+{
+   if (ctx->inline_decl && def->index < ctx->inline_decl_count && ctx->inline_decl[def->index]) {
+      const char *type = msl_type_for_def(ctx->types, def);
+      P_IND(ctx, "%s t%u = ", type, def->index);
+   } else {
+      P_IND(ctx, "t%u = ", def->index);
+   }
+}
+
+static bool
+uses_in_same_block(nir_def *def)
+{
+   nir_block *home = nir_def_instr(def)->block;
+   nir_foreach_use(use, def) {
+      if (nir_src_is_if(use) || nir_src_use_instr(use)->block != home)
+         return false;
+   }
+   return true;
+}
+
 static void
 tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 {
@@ -1819,7 +1888,7 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    // Projectors have to be lowered away to regular arithmetic
    assert(!nir_tex_get_src(tex, nir_tex_src_projector));
 
-   P_IND(ctx, "t%d = ", tex->def.index);
+   emit_def_assign_start(ctx, &tex->def);
 
    switch (tex->op) {
    case nir_texop_tex:
@@ -2050,6 +2119,7 @@ jump_instr_to_msl(struct nir_to_msl_ctx *ctx, nir_jump_instr *jump)
 static const char *
 alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
 {
+   return NULL; /* pragma-free required: any scope breaks the largest program */
    unsigned fp_math_ctrl = alu->fp_math_ctrl;
 
    /* TODO_KOSMICKRISP Investigate why bcsel do not have inf nan preserve */
@@ -2080,7 +2150,7 @@ alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
     * needed. */
    if (fp_math_ctrl & (nir_fp_preserve_inf | nir_fp_preserve_nan |
                        nir_fp_preserve_signed_zero))
-      return "relaxed";
+      return NULL; /* relaxed is the library's math mode; only "safe" needs a scope */
    return NULL;
 }
 
@@ -2103,6 +2173,8 @@ instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
    switch (instr->type) {
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (ctx->fold && alu->def.index < ctx->fold_count && ctx->fold[alu->def.index])
+         break;
       const char *math_mode = alu_fp_math_mode_pragma(ctx, alu);
       if (math_mode != ctx->open_math) {
          close_math_block(ctx);
@@ -2113,7 +2185,7 @@ instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
             P_IND(ctx, "#pragma METAL fp math_mode(%s)\n", math_mode);
          }
       }
-      P_IND(ctx, "t%d = ", alu->def.index);
+      emit_def_assign_start(ctx, &alu->def);
       alu_to_msl(ctx, alu);
       P(ctx, ";\n");
       break;
@@ -2448,6 +2520,12 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
 static void
 predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
 {
+   if (!ctx->inline_decl) {
+      ctx->inline_decl = calloc(impl->ssa_alloc, 1);
+      ctx->fold = calloc(impl->ssa_alloc, 1);
+      ctx->fold_count = impl->ssa_alloc;
+      ctx->inline_decl_count = impl->ssa_alloc;
+   }
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          nir_def *def;
@@ -2472,6 +2550,12 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
          default:
             continue;
          }
+         if (instr->type == nir_instr_type_alu && ctx->fold && def->index < ctx->fold_count &&
+             def->bit_size != 1 && !alu_fp_math_mode_pragma(ctx, nir_instr_as_alu(instr)) &&
+             folds_into_use(ctx, def) && !fold_has_folded_src(ctx, nir_instr_as_alu(instr))) {
+            ctx->fold[def->index] = 1;
+            continue;
+         }
          if (msl_def_is_texture(ctx, def)) {
             P_INDENT(ctx);
             msl_emit_texture_type(ctx, nir_instr_as_intrinsic(instr));
@@ -2482,6 +2566,11 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
                continue;
             if (msl_def_is_sampler(ctx, def)) {
                P_IND(ctx, "%s t%u;\n", type, def->index);
+            } else if (ctx->inline_decl && def->index < ctx->inline_decl_count &&
+                       uses_in_same_block(def) &&
+                       !(instr->type == nir_instr_type_alu &&
+                         alu_fp_math_mode_pragma(ctx, nir_instr_as_alu(instr)))) {
+               ctx->inline_decl[def->index] = 1;
             } else
                P_IND(ctx, "%s t%u = %s(0);\n", type, def->index, type);
          }

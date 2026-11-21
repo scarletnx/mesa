@@ -31,6 +31,10 @@ struct nir_to_msl_ctx {
    /* the fp math mode of the block that is open, or NULL: consecutive ALU ops with one mode share
       a single #pragma scope instead of one scope each, which halves a large shader's text */
    const char *open_math;
+   unsigned char *inline_decl;
+   unsigned inline_decl_count;
+   unsigned char *fold;
+   unsigned fold_count;
 };
 
 #define P_IND(ctx, ...)                                                        \
