@@ -167,6 +167,12 @@ writemask_to_msl(struct nir_to_msl_ctx *ctx, unsigned write_mask,
    }
 }
 
+static nir_variable *cmat_var(nir_src src);
+static unsigned cmat_var_index(nir_src src);
+static bool cmat_is_half(nir_src src);
+static void cmat_splat_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, bool half);
+static void emit_cmat_locals(struct nir_to_msl_ctx *ctx, nir_function_impl *impl);
+
 static void
 src_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src)
 {
@@ -1799,25 +1805,32 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       /* Point to NULL, not really used currently */
       P(ctx, "0x0;\n");
       break;
-   case nir_intrinsic_cmat_load: {
-      const int m = instr->def.bit_size == 16;
-      P_IND(ctx, "%s t%d;\n", m ? "simdgroup_half8x8" : "simdgroup_float8x8", instr->def.index);
-      P_IND(ctx, "simdgroup_load(t%d, (threadgroup %s*)&", instr->def.index, m ? "half" : "float");
-      src_to_msl(ctx, &instr->src[0]);
-      P(ctx, "[");
+   /* The matrix operands are derefs of cmat variables, which emit_cmat_locals declares. */
+   case nir_intrinsic_cmat_construct:
+      P_IND(ctx, "cm%u = %s(", cmat_var_index(instr->src[0]),
+            cmat_is_half(instr->src[0]) ? "simdgroup_half8x8" : "simdgroup_float8x8");
+      cmat_splat_to_msl(ctx, &instr->src[1], cmat_is_half(instr->src[0]));
+      P(ctx, ");\n");
+      break;
+   case nir_intrinsic_cmat_muladd:
+      P_IND(ctx, "simdgroup_multiply_accumulate(cm%u, cm%u, cm%u, cm%u);\n",
+            cmat_var_index(instr->src[0]), cmat_var_index(instr->src[1]),
+            cmat_var_index(instr->src[2]), cmat_var_index(instr->src[3]));
+      break;
+   case nir_intrinsic_cmat_load:
+      assert(nir_src_is_const(instr->src[2]));
+      P_IND(ctx, "simdgroup_load(cm%u, (threadgroup %s*)", cmat_var_index(instr->src[0]),
+            cmat_is_half(instr->src[0]) ? "half" : "float");
       src_to_msl(ctx, &instr->src[1]);
-      P(ctx, "], 8);\n");
+      P(ctx, ", %uu);\n", (unsigned)nir_src_as_uint(instr->src[2]));
       break;
-   }
-   case nir_intrinsic_cmat_store: {
-      const int m = instr->src[1].ssa ? instr->src[1].ssa->bit_size == 16 : 0;
-      P_IND(ctx, "simdgroup_store(t%d, (threadgroup %s*)&", instr->src[0].ssa->index, m ? "half" : "float");
-      src_to_msl(ctx, &instr->src[2]);
-      P(ctx, "[");
-      src_to_msl(ctx, &instr->src[3]);
-      P(ctx, "], 8);\n");
+   case nir_intrinsic_cmat_store:
+      assert(nir_src_is_const(instr->src[2]));
+      P_IND(ctx, "simdgroup_store(cm%u, (threadgroup %s*)", cmat_var_index(instr->src[1]),
+            cmat_is_half(instr->src[1]) ? "half" : "float");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ", %uu);\n", (unsigned)nir_src_as_uint(instr->src[2]));
       break;
-   }
    default:
       P_IND(ctx, "Unknown intrinsic %s\n", info->name);
    }
@@ -1875,6 +1888,62 @@ folds_into_use(struct nir_to_msl_ctx *ctx, nir_def *def)
          return false;
    }
    return true;
+}
+
+/* A cooperative matrix is a local variable of the function, and each use of it
+ * is a deref of that variable. The variable's index (from
+ * nir_function_impl_index_vars) names it cm<index>. */
+static nir_variable *
+cmat_var(nir_src src)
+{
+   return nir_deref_instr_get_variable(nir_src_as_deref(src));
+}
+
+static unsigned
+cmat_var_index(nir_src src)
+{
+   return cmat_var(src)->index;
+}
+
+static bool
+cmat_is_half(nir_src src)
+{
+   return glsl_get_cmat_description(cmat_var(src)->type)->element_type == GLSL_TYPE_FLOAT16;
+}
+
+/* The splat value of a construct. A constant is printed as its bits, because
+ * src_to_msl would print an untyped literal for it. The bit size must match the
+ * element type, which is what NIR gives for a cooperative matrix. */
+static void
+cmat_splat_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, bool half)
+{
+   const unsigned want = half ? 16 : 32;
+   assert(nir_src_bit_size(*src) == want);
+   if (nir_src_is_const(*src)) {
+      const uint64_t bits = nir_src_comp_as_uint(*src, 0);
+      if (half) {
+         P(ctx, "as_type<half>((ushort)%uu)", (unsigned)bits);
+      } else {
+         P(ctx, "as_type<float>(%uu)", (unsigned)bits);
+      }
+   } else {
+      P(ctx, "as_type<%s>(", half ? "half" : "float");
+      src_to_msl(ctx, src);
+      P(ctx, ")");
+   }
+}
+
+/* One declaration per cooperative matrix variable, at the top of the function. */
+static void
+emit_cmat_locals(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+{
+   nir_function_impl_index_vars(impl);
+   nir_foreach_function_temp_variable(var, impl) {
+      if (!glsl_type_is_cmat(var->type))
+         continue;
+      const bool half = glsl_get_cmat_description(var->type)->element_type == GLSL_TYPE_FLOAT16;
+      P_IND(ctx, "%s cm%u;\n", half ? "simdgroup_half8x8" : "simdgroup_float8x8", var->index);
+   }
 }
 
 static void
@@ -2210,7 +2279,9 @@ instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
       break;
    }
    case nir_instr_type_deref:
-      assert(!"We should have lowered derefs by now");
+      /* Only the derefs of cooperative matrix variables survive lowering. Their
+       * intrinsics name the variable, so the deref itself emits nothing. */
+      assert(glsl_type_is_cmat(nir_instr_as_deref(instr)->type));
       break;
    case nir_instr_type_call:
    case nir_instr_type_cmat_call:
@@ -2670,6 +2741,7 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
 
    msl_emit_output_var(&ctx, shader);
    emit_local_vars(&ctx, shader);
+   emit_cmat_locals(&ctx, impl);
    predeclare_ssa_values(&ctx, impl);
    foreach_list_typed(nir_cf_node, node, node, &impl->body) {
       cf_node_to_metal(&ctx, node);
