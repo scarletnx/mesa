@@ -2085,21 +2085,37 @@ alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
 }
 
 static void
+close_math_block(struct nir_to_msl_ctx *ctx)
+{
+   if (ctx->open_math) {
+      ctx->indentlevel--;
+      P_IND(ctx, "}\n");
+      ctx->open_math = NULL;
+   }
+}
+
+static void
 instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
 {
+   if (instr->type != nir_instr_type_alu)
+      close_math_block(ctx);
+
    switch (instr->type) {
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
       const char *math_mode = alu_fp_math_mode_pragma(ctx, alu);
-      if (math_mode) {
-         P_IND(ctx, "{\n");
-         P_IND(ctx, "#pragma METAL fp math_mode(%s)\n", math_mode);
+      if (math_mode != ctx->open_math) {
+         close_math_block(ctx);
+         if (math_mode) {
+            ctx->open_math = math_mode;
+            P_IND(ctx, "{\n");
+            ctx->indentlevel++;
+            P_IND(ctx, "#pragma METAL fp math_mode(%s)\n", math_mode);
+         }
       }
       P_IND(ctx, "t%d = ", alu->def.index);
       alu_to_msl(ctx, alu);
       P(ctx, ";\n");
-      if (math_mode)
-         P_IND(ctx, "}\n");
       break;
    }
    case nir_instr_type_deref:
@@ -2139,6 +2155,7 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
       nir_foreach_instr(instr, block) {
          instr_to_msl(ctx, instr);
       }
+      close_math_block(ctx);
       break;
    }
    case nir_cf_node_if: {
