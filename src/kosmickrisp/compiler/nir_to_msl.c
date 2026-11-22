@@ -5,6 +5,7 @@
  */
 
 #include "nir_to_msl.h"
+#include <stdlib.h>
 #include "msl_private.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -69,6 +70,10 @@ static const char *sysval_table[SYSTEM_VALUE_MAX] = {
 };
 static const char *sysval_sample_mask_in_post_depth_coverage =
    "uint gl_SampleMask [[sample_mask, post_depth_coverage]]";
+
+static void emit_def_assign_start(struct nir_to_msl_ctx *ctx, nir_def *def);
+static bool uses_in_same_block(nir_def *def);
+static void alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr);
 
 static void
 emit_sysvals(struct nir_to_msl_ctx *ctx, nir_shader *shader)
@@ -162,6 +167,12 @@ writemask_to_msl(struct nir_to_msl_ctx *ctx, unsigned write_mask,
    }
 }
 
+static nir_variable *cmat_var(nir_src src);
+static unsigned cmat_var_index(nir_src src);
+static bool cmat_is_half(nir_src src);
+static void cmat_splat_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, bool half);
+static void emit_cmat_locals(struct nir_to_msl_ctx *ctx, nir_function_impl *impl);
+
 static void
 src_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src)
 {
@@ -199,6 +210,10 @@ src_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src)
       }
    } else if (nir_src_is_const(*src)) {
       msl_src_as_const(ctx, src);
+   } else if (ctx->fold && src->ssa->index < ctx->fold_count && ctx->fold[src->ssa->index]) {
+      P(ctx, "((%s)(", msl_type_for_src(ctx->types, src));
+      alu_to_msl(ctx, nir_instr_as_alu(nir_def_instr(src->ssa)));
+      P(ctx, "))");
    } else {
       P(ctx, "t%d", src->ssa->index);
    }
@@ -903,6 +918,47 @@ src_to_packed_store(struct nir_to_msl_ctx *ctx, nir_src *src,
    P(ctx, ")");
 }
 
+/* The address of a cooperative matrix load or store. The layout is the one
+ * of addr_to_global in nir_lower_explicit_io.c: a 4-component global address
+ * (bounded or 32-bit offset, the SSBO formats of kk) has the 64-bit base in
+ * .x (low) and .y (high), its size in .z and its byte offset in .w. A scalar
+ * 64-bit address is a device address. A scalar 32-bit address is an offset
+ * into the shared memory of the workgroup (32bit_offset). */
+/* MSL's simdgroup_load and simdgroup_store take a transpose flag in place of a
+ * layout enum. A column-major matrix in memory is the transpose of the row-major
+ * one, so the flag is set for it. The defaults (origin 0, no transpose) stay
+ * for row-major, and for GLSL_MATRIX_LAYOUT_INHERITED, which reads as row-major.
+ */
+static const char *
+cmat_transpose_args(nir_intrinsic_instr *instr)
+{
+   return nir_intrinsic_matrix_layout(instr) == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR
+             ? ", ulong2(0, 0), true"
+             : "";
+}
+
+static void
+cmat_ptr_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, const char *type)
+{
+   if (src->ssa->num_components == 4) {
+      P(ctx, "(device %s*)((((ulong)(", type);
+      src_to_msl(ctx, src);
+      P(ctx, ").y << 32) | (ulong)(");
+      src_to_msl(ctx, src);
+      P(ctx, ").x) + (");
+      src_to_msl(ctx, src);
+      P(ctx, ").w)");
+   } else if (src->ssa->bit_size == 64) {
+      P(ctx, "(device %s*)(", type);
+      src_to_msl(ctx, src);
+      P(ctx, ")");
+   } else {
+      P(ctx, "(threadgroup %s*)&shared_data[", type);
+      src_to_msl(ctx, src);
+      P(ctx, "]");
+   }
+}
+
 static const char *
 atomic_op_to_msl(nir_atomic_op op)
 {
@@ -1107,7 +1163,7 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 
    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
    if (instrinsic_needs_dest_type(instr)) {
-      P_IND(ctx, "t%d = ", instr->def.index);
+      emit_def_assign_start(ctx, &instr->def);
    }
    switch (instr->intrinsic) {
    case nir_intrinsic_decl_reg: {
@@ -1790,6 +1846,38 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       /* Point to NULL, not really used currently */
       P(ctx, "0x0;\n");
       break;
+   /* The matrix operands are derefs of cmat variables, which emit_cmat_locals declares. */
+   case nir_intrinsic_cmat_construct:
+      P_IND(ctx, "cm%u = %s(", cmat_var_index(instr->src[0]),
+            cmat_is_half(instr->src[0]) ? "simdgroup_half8x8" : "simdgroup_float8x8");
+      cmat_splat_to_msl(ctx, &instr->src[1], cmat_is_half(instr->src[0]));
+      P(ctx, ");\n");
+      break;
+   case nir_intrinsic_cmat_copy:
+      /* src[0] is the destination variable, src[1] the source (split_cmat_copy reads them in that order) */
+      P_IND(ctx, "cm%u = cm%u;\n", cmat_var_index(instr->src[0]), cmat_var_index(instr->src[1]));
+      break;
+   case nir_intrinsic_cmat_muladd:
+      P_IND(ctx, "simdgroup_multiply_accumulate(cm%u, cm%u, cm%u, cm%u);\n",
+            cmat_var_index(instr->src[0]), cmat_var_index(instr->src[1]),
+            cmat_var_index(instr->src[2]), cmat_var_index(instr->src[3]));
+      break;
+   case nir_intrinsic_cmat_load:
+      assert(nir_src_is_const(instr->src[2]));
+      P_IND(ctx, "simdgroup_load(cm%u, ", cmat_var_index(instr->src[0]));
+      cmat_ptr_to_msl(ctx, &instr->src[1],
+                      cmat_is_half(instr->src[0]) ? "half" : "float");
+      P(ctx, ", %uu%s);\n", (unsigned)nir_src_as_uint(instr->src[2]),
+        cmat_transpose_args(instr));
+      break;
+   case nir_intrinsic_cmat_store:
+      assert(nir_src_is_const(instr->src[2]));
+      P_IND(ctx, "simdgroup_store(cm%u, ", cmat_var_index(instr->src[1]));
+      cmat_ptr_to_msl(ctx, &instr->src[0],
+                      cmat_is_half(instr->src[1]) ? "half" : "float");
+      P(ctx, ", %uu%s);\n", (unsigned)nir_src_as_uint(instr->src[2]),
+        cmat_transpose_args(instr));
+      break;
    default:
       P_IND(ctx, "Unknown intrinsic %s\n", info->name);
    }
@@ -1811,6 +1899,122 @@ tex_coord_swizzle(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
                              tex->coord_components, false, tex->is_array);
 }
 
+#define KK_FOLD_MAX 6
+static unsigned
+fold_cost(struct nir_to_msl_ctx *ctx, nir_alu_instr *alu)
+{
+   unsigned n = 1;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      nir_src *s2 = &alu->src[i].src;
+      if (s2->ssa && s2->ssa->index < ctx->fold_count && ctx->fold[s2->ssa->index])
+         n += fold_cost(ctx, nir_instr_as_alu(nir_def_instr(s2->ssa)));
+   }
+   return n;
+}
+
+static bool
+fold_has_folded_src(struct nir_to_msl_ctx *ctx, nir_alu_instr *alu)
+{
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      nir_src *s2 = &alu->src[i].src;
+      if (s2->ssa && s2->ssa->index < ctx->fold_count && ctx->fold[s2->ssa->index])
+         return true;
+   }
+   return false;
+}
+
+static bool
+folds_into_use(struct nir_to_msl_ctx *ctx, nir_def *def)
+{
+   if (!uses_in_same_block(def))
+      return false;
+   nir_foreach_use(use, def) {
+      if (msl_bitcast_for_src(ctx->types, use) != NULL)
+         return false;
+      if (!msl_type_for_src(ctx->types, use))
+         return false;
+   }
+   return true;
+}
+
+/* A cooperative matrix is a local variable of the function, and each use of it
+ * is a deref of that variable. The variable's index (from
+ * nir_function_impl_index_vars) names it cm<index>. */
+static nir_variable *
+cmat_var(nir_src src)
+{
+   return nir_deref_instr_get_variable(nir_src_as_deref(src));
+}
+
+static unsigned
+cmat_var_index(nir_src src)
+{
+   return cmat_var(src)->index;
+}
+
+static bool
+cmat_is_half(nir_src src)
+{
+   return glsl_get_cmat_description(cmat_var(src)->type)->element_type == GLSL_TYPE_FLOAT16;
+}
+
+/* The splat value of a construct. A constant is printed as its bits, because
+ * src_to_msl would print an untyped literal for it. The bit size must match the
+ * element type, which is what NIR gives for a cooperative matrix. */
+static void
+cmat_splat_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src, bool half)
+{
+   const unsigned want = half ? 16 : 32;
+   assert(nir_src_bit_size(*src) == want);
+   if (nir_src_is_const(*src)) {
+      const uint64_t bits = nir_src_comp_as_uint(*src, 0);
+      if (half) {
+         P(ctx, "as_type<half>((ushort)%uu)", (unsigned)bits);
+      } else {
+         P(ctx, "as_type<float>(%uu)", (unsigned)bits);
+      }
+   } else {
+      P(ctx, "as_type<%s>(", half ? "half" : "float");
+      src_to_msl(ctx, src);
+      P(ctx, ")");
+   }
+}
+
+/* One declaration per cooperative matrix variable, at the top of the function. */
+static void
+emit_cmat_locals(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+{
+   nir_function_impl_index_vars(impl);
+   nir_foreach_function_temp_variable(var, impl) {
+      if (!glsl_type_is_cmat(var->type))
+         continue;
+      const bool half = glsl_get_cmat_description(var->type)->element_type == GLSL_TYPE_FLOAT16;
+      P_IND(ctx, "%s cm%u;\n", half ? "simdgroup_half8x8" : "simdgroup_float8x8", var->index);
+   }
+}
+
+static void
+emit_def_assign_start(struct nir_to_msl_ctx *ctx, nir_def *def)
+{
+   if (ctx->inline_decl && def->index < ctx->inline_decl_count && ctx->inline_decl[def->index]) {
+      const char *type = msl_type_for_def(ctx->types, def);
+      P_IND(ctx, "%s t%u = ", type, def->index);
+   } else {
+      P_IND(ctx, "t%u = ", def->index);
+   }
+}
+
+static bool
+uses_in_same_block(nir_def *def)
+{
+   nir_block *home = nir_def_instr(def)->block;
+   nir_foreach_use(use, def) {
+      if (nir_src_is_if(use) || nir_src_use_instr(use)->block != home)
+         return false;
+   }
+   return true;
+}
+
 static void
 tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 {
@@ -1819,7 +2023,7 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    // Projectors have to be lowered away to regular arithmetic
    assert(!nir_tex_get_src(tex, nir_tex_src_projector));
 
-   P_IND(ctx, "t%d = ", tex->def.index);
+   emit_def_assign_start(ctx, &tex->def);
 
    switch (tex->op) {
    case nir_texop_tex:
@@ -2050,6 +2254,7 @@ jump_instr_to_msl(struct nir_to_msl_ctx *ctx, nir_jump_instr *jump)
 static const char *
 alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
 {
+   return NULL; /* pragma-free required: any scope breaks the largest program */
    unsigned fp_math_ctrl = alu->fp_math_ctrl;
 
    /* TODO_KOSMICKRISP Investigate why bcsel do not have inf nan preserve */
@@ -2080,30 +2285,50 @@ alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
     * needed. */
    if (fp_math_ctrl & (nir_fp_preserve_inf | nir_fp_preserve_nan |
                        nir_fp_preserve_signed_zero))
-      return "relaxed";
+      return NULL; /* relaxed is the library's math mode; only "safe" needs a scope */
    return NULL;
+}
+
+static void
+close_math_block(struct nir_to_msl_ctx *ctx)
+{
+   if (ctx->open_math) {
+      ctx->indentlevel--;
+      P_IND(ctx, "}\n");
+      ctx->open_math = NULL;
+   }
 }
 
 static void
 instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
 {
+   if (instr->type != nir_instr_type_alu)
+      close_math_block(ctx);
+
    switch (instr->type) {
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (ctx->fold && alu->def.index < ctx->fold_count && ctx->fold[alu->def.index])
+         break;
       const char *math_mode = alu_fp_math_mode_pragma(ctx, alu);
-      if (math_mode) {
-         P_IND(ctx, "{\n");
-         P_IND(ctx, "#pragma METAL fp math_mode(%s)\n", math_mode);
+      if (math_mode != ctx->open_math) {
+         close_math_block(ctx);
+         if (math_mode) {
+            ctx->open_math = math_mode;
+            P_IND(ctx, "{\n");
+            ctx->indentlevel++;
+            P_IND(ctx, "#pragma METAL fp math_mode(%s)\n", math_mode);
+         }
       }
-      P_IND(ctx, "t%d = ", alu->def.index);
+      emit_def_assign_start(ctx, &alu->def);
       alu_to_msl(ctx, alu);
       P(ctx, ";\n");
-      if (math_mode)
-         P_IND(ctx, "}\n");
       break;
    }
    case nir_instr_type_deref:
-      assert(!"We should have lowered derefs by now");
+      /* Only the derefs of cooperative matrix variables survive lowering. Their
+       * intrinsics name the variable, so the deref itself emits nothing. */
+      assert(glsl_type_is_cmat(nir_instr_as_deref(instr)->type));
       break;
    case nir_instr_type_call:
    case nir_instr_type_cmat_call:
@@ -2139,6 +2364,7 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
       nir_foreach_instr(instr, block) {
          instr_to_msl(ctx, instr);
       }
+      close_math_block(ctx);
       break;
    }
    case nir_cf_node_if: {
@@ -2431,6 +2657,12 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
 static void
 predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
 {
+   if (!ctx->inline_decl) {
+      ctx->inline_decl = calloc(impl->ssa_alloc, 1);
+      ctx->fold = calloc(impl->ssa_alloc, 1);
+      ctx->fold_count = impl->ssa_alloc;
+      ctx->inline_decl_count = impl->ssa_alloc;
+   }
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          nir_def *def;
@@ -2455,6 +2687,12 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
          default:
             continue;
          }
+         if (instr->type == nir_instr_type_alu && ctx->fold && def->index < ctx->fold_count &&
+             def->bit_size != 1 && !alu_fp_math_mode_pragma(ctx, nir_instr_as_alu(instr)) &&
+             folds_into_use(ctx, def) && !fold_has_folded_src(ctx, nir_instr_as_alu(instr))) {
+            ctx->fold[def->index] = 1;
+            continue;
+         }
          if (msl_def_is_texture(ctx, def)) {
             P_INDENT(ctx);
             msl_emit_texture_type(ctx, nir_instr_as_intrinsic(instr));
@@ -2465,6 +2703,11 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
                continue;
             if (msl_def_is_sampler(ctx, def)) {
                P_IND(ctx, "%s t%u;\n", type, def->index);
+            } else if (ctx->inline_decl && def->index < ctx->inline_decl_count &&
+                       uses_in_same_block(def) &&
+                       !(instr->type == nir_instr_type_alu &&
+                         alu_fp_math_mode_pragma(ctx, nir_instr_as_alu(instr)))) {
+               ctx->inline_decl[def->index] = 1;
             } else
                P_IND(ctx, "%s t%u = %s(0);\n", type, def->index, type);
          }
@@ -2545,6 +2788,7 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
 
    msl_emit_output_var(&ctx, shader);
    emit_local_vars(&ctx, shader);
+   emit_cmat_locals(&ctx, impl);
    predeclare_ssa_values(&ctx, impl);
    foreach_list_typed(nir_cf_node, node, node, &impl->body) {
       cf_node_to_metal(&ctx, node);
