@@ -522,7 +522,17 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_base_image_params *image_params = NULL;
    struct wsi_cpu_image_params cpu_params;
    struct wsi_drm_image_params drm_params;
-   if (wsi_device->sw) {
+   /* A build without libdrm has no DRM case in get_blit_type or configure_image, and their default is UNREACHABLE. A
+      headless image here is therefore the CPU kind, whatever the device says: the DRM kind would be an image with no
+      blit command buffers, and present would submit a null one. */
+#if defined(HAVE_LIBDRM)
+   const bool cpu_image = wsi_device->sw;
+#else
+   const bool cpu_image = true;
+   (void)mods;
+   (void)mod_props;
+#endif
+   if (cpu_image) {
       cpu_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
       };
