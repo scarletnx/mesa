@@ -143,6 +143,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
 
       /* Optional extensions */
       .KHR_calibrated_timestamps = true,
+      .KHR_cooperative_matrix = true,
       .KHR_deferred_host_operations = true,
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
@@ -362,6 +363,9 @@ kk_get_device_features(
 
       /* VK_EXT_mutable_descriptor_type */
       .mutableDescriptorType = true,
+
+      /* VK_KHR_cooperative_matrix */
+      .cooperativeMatrix = true,
 
       /* VK_KHR_maintenance7 */
       .maintenance7 = true,
@@ -1274,6 +1278,12 @@ kk_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 {
    vk_common_GetPhysicalDeviceProperties2(physicalDevice, pProperties);
 
+   VkPhysicalDeviceCooperativeMatrixPropertiesKHR *coop_props =
+      vk_find_struct(pProperties->pNext,
+                     PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR);
+   if (coop_props)
+      coop_props->cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT;
+
    /* Properly populate layered API properties */
    VkPhysicalDeviceLayeredApiPropertiesListKHR *layered_props_list =
       vk_find_struct(pProperties->pNext,
@@ -1292,6 +1302,36 @@ kk_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
    layered_props->layeredAPI = VK_PHYSICAL_DEVICE_LAYERED_API_METAL_KHR;
    strncpy(layered_props->deviceName, pProperties->properties.deviceName,
            VK_MAX_PHYSICAL_DEVICE_NAME_SIZE);
+}
+
+/* The Metal backend emits simdgroup_matrix, which is one 8x8 tile of half
+ * inputs with a float accumulator. So 8x8x8 is the only shape it can run, and
+ * it is the only one we advertise. */
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixPropertiesKHR *pProperties)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
+                          pPropertyCount);
+
+   vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+   {
+      *p = (VkCooperativeMatrixPropertiesKHR){
+         .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+         .MSize = 16,
+         .NSize = 16,
+         .KSize = 16,
+         .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+         .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+         .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+         .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+         .saturatingAccumulation = VK_FALSE,
+         .scope = VK_SCOPE_SUBGROUP_KHR,
+      };
+   }
+
+   return vk_outarray_status(&out);
 }
 
 VKAPI_ATTR void VKAPI_CALL
